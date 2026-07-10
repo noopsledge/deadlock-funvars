@@ -1,10 +1,10 @@
+mod remote;
+
 use anyhow::{Context, bail};
-use std::alloc::{Layout, alloc, dealloc};
 use std::cmp::Ordering;
 use std::ffi::CStr;
 use std::mem::MaybeUninit;
 use std::range::Range;
-use std::slice;
 use windows::{
 	Win32::Foundation::*,
 	Win32::System::Diagnostics::Debug::*,
@@ -51,12 +51,12 @@ fn main() -> anyhow::Result<()> {
 
 	// Read the entire DLL in one go to avoid needing to jump around with lots of
 	// little reads.
-	let dll_data = RemoteMemory::new(*process, dll_range)
+	let dll_data = remote::Memory::new(*process, dll_range)
 		.context("Failed to read the dll data.")?;
 
 	let exports = unsafe {
 		let exports_ptr = ImageDirectoryEntryToData(
-			dll_data.local_ptr as _,
+			dll_data.as_ptr() as _,
 			true,
 			IMAGE_DIRECTORY_ENTRY_EXPORT,
 			MaybeUninit::uninit().as_mut_ptr(),
@@ -123,124 +123,9 @@ unsafe fn find_module(pid: u32, name: PCWSTR) -> windows::core::Result<Range<usi
 	}
 }
 
-/// Reads a single value from a process's address space.
-fn remote_read<T>(process: HANDLE, addr: usize) -> windows::core::Result<T> {
-	unsafe {
-		let mut buffer = MaybeUninit::uninit();
-		ReadProcessMemory(
-			process,
-			addr as _,
-			buffer.as_mut_ptr() as _,
-			size_of::<T>(),
-			None,
-		)?;
-		Ok(buffer.assume_init())
-	}
-}
-
-/// Writes a single value to a process's address space.
-fn remote_write<T>(process: HANDLE, addr: usize, value: T) -> windows::core::Result<()> {
-	unsafe {
-		WriteProcessMemory(
-			process,
-			addr as _,
-			&raw const value as _,
-			size_of::<T>(),
-			None,
-		)
-	}
-}
-
-/// Reads a large chunk of memory from another process and keeps enough state to
-/// map addresses between processes.
-struct RemoteMemory {
-	local_ptr: *mut u8,
-	size: usize,
-	remote_base: usize,
-}
-
-impl RemoteMemory {
-	const ALIGN: usize = 16;
-
-	fn new(process: HANDLE, range: Range<usize>) -> windows::core::Result<RemoteMemory> {
-		let size = range.end - range.start;
-		let layout = Layout::from_size_align(size, Self::ALIGN).unwrap();
-		unsafe {
-			// The memory is manually allocated so that we can control the alignment.
-			let remote_mem = RemoteMemory {
-				local_ptr: alloc(layout),
-				size,
-				remote_base: range.start,
-			};
-			ReadProcessMemory(
-				process,
-				remote_mem.remote_base as _,
-				remote_mem.local_ptr as _,
-				size,
-				None,
-			)?;
-			Ok(remote_mem)
-		}
-	}
-
-	/// Whether it's valid to read an array of `count` instances of `T` from `rva`.
-	/// This will ensure that the buffer we have is suitably sized and aligned.
-	fn can_read<T>(&self, rva: usize, count: usize) -> bool {
-		align_of::<T>() <= Self::ALIGN
-			&& rva & (align_of::<T>() - 1) == 0
-			&& rva < self.size
-			&& self.size - rva >= size_of::<T>() * count
-	}
-
-	/// Gets a reference to an instance of `T` at offset `rva`.
-	fn get<T>(&self, rva: usize) -> Option<&T> {
-		if self.can_read::<T>(rva, 1) {
-			Some(unsafe { &*(self.local_ptr.add(rva) as *const T) })
-		} else {
-			None
-		}
-	}
-
-	/// Gets a slice of `count` instances of `T` at offset `rva`.
-	fn get_array<T>(&self, rva: usize, count: usize) -> Option<&[T]> {
-		if self.can_read::<T>(rva, count) {
-			Some(unsafe { slice::from_raw_parts(self.local_ptr.add(rva) as _, count) })
-		} else {
-			None
-		}
-	}
-
-	/// Converts an absolute remote address to a relative offset.
-	fn get_rva(&self, remote_addr: usize) -> Option<usize> {
-		remote_addr.checked_sub(self.remote_base)
-	}
-
-	/// Converts a remote pointer to a local reference.
-	fn from_remote<T>(&self, ptr: *const T) -> Option<&T> {
-		let rva = self.get_rva(ptr as usize)?;
-		self.get(rva)
-	}
-
-	/// Converts a remote pointer to a local slice.
-	fn from_remote_array<T>(&self, ptr: *const T, count: usize) -> Option<&[T]> {
-		let rva = self.get_rva(ptr as usize)?;
-		self.get_array(rva, count)
-	}
-}
-
-impl Drop for RemoteMemory {
-	fn drop(&mut self) {
-		unsafe {
-			// Layout is known to be valid from `new()`.
-			let layout = Layout::from_size_align_unchecked(self.size, Self::ALIGN);
-			dealloc(self.local_ptr, layout);
-		}
-	}
-}
-
 /// Gets the RVA of an exported function by name.
 fn find_export(
-	image: &RemoteMemory,
+	image: &remote::Memory,
 	exports: &IMAGE_EXPORT_DIRECTORY,
 	name: &CStr,
 ) -> Option<usize> {
@@ -266,7 +151,7 @@ fn find_export(
 /// `insn_prefix` should be all of the bytes of the instruction up to the
 /// variable offset, which is used to validate that we're looking at the
 /// expected instruction.
-fn get_addr_operand(image: &RemoteMemory, insn_rva: usize, insn_prefix: &[u8]) -> Option<usize> {
+fn get_addr_operand(image: &remote::Memory, insn_rva: usize, insn_prefix: &[u8]) -> Option<usize> {
 	let prefix_len = insn_prefix.len();
 	let insn = image.get_array(insn_rva, prefix_len + size_of::<i32>())?;
 	if insn.starts_with(insn_prefix) {
@@ -280,7 +165,7 @@ fn get_addr_operand(image: &RemoteMemory, insn_rva: usize, insn_prefix: &[u8]) -
 
 /// Traverses the linked list of interface registrations to find the RVA of the
 /// factory function for the interface with the given name.
-fn find_interface_factory(image: &RemoteMemory, reg_list: usize, name: &CStr) -> Option<usize> {
+fn find_interface_factory(image: &remote::Memory, reg_list: usize, name: &CStr) -> Option<usize> {
 	#[repr(C)]
 	struct RegNode {
 		factory: usize,
@@ -307,7 +192,11 @@ fn find_interface_factory(image: &RemoteMemory, reg_list: usize, name: &CStr) ->
 }
 
 /// Patches convar flags to make them show up in game.
-fn patch_vars(image: &RemoteMemory, process: HANDLE, cvars: usize) -> windows::core::Result<usize> {
+fn patch_vars(
+	image: &remote::Memory,
+	process: HANDLE,
+	cvars: usize,
+) -> windows::core::Result<usize> {
 	#[repr(C)]
 	struct CVars {
 		_0x00: [u8; 0x42],
@@ -345,14 +234,14 @@ fn patch_vars(image: &RemoteMemory, process: HANDLE, cvars: usize) -> windows::c
 
 		loop {
 			let node_addr = buckets + (node_index as usize) * size_of::<Node>();
-			let node = remote_read::<Node>(process, node_addr)?;
+			let node = remote::read::<Node>(process, node_addr)?;
 			let flags_addr = node.data + FLAGS_OFFSET;
-			let mut flags = remote_read::<u64>(process, flags_addr)?;
+			let mut flags = remote::read::<u64>(process, flags_addr)?;
 
 			if (flags & FLAG_DEVELOPMENTONLY) != 0 {
 				// Write back with the flag removed.
 				flags &= !FLAG_DEVELOPMENTONLY;
-				remote_write(process, flags_addr, flags)?;
+				remote::write(process, flags_addr, flags)?;
 				count += 1;
 			}
 
