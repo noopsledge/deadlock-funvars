@@ -1,9 +1,10 @@
+mod cvar;
 mod remote;
 
 use anyhow::{Context, bail};
 use std::cmp::Ordering;
 use std::ffi::CStr;
-use std::mem::MaybeUninit;
+use std::mem::{MaybeUninit, offset_of};
 use std::range::Range;
 use windows::{
 	Win32::Foundation::*,
@@ -80,7 +81,7 @@ fn main() -> anyhow::Result<()> {
 		.context("Failed to get the address of the VEngineCvar007 instance.")?;
 
 	let count = patch_vars(&dll_data, *process, cvars).context("Failed to patch convars.")?;
-	println!("Successfully patched {} convars.", count);
+	println!("Successfully patched {} convars/concommands.", count);
 
 	Ok(())
 }
@@ -197,57 +198,36 @@ fn patch_vars(
 	process: HANDLE,
 	cvars: usize,
 ) -> windows::core::Result<usize> {
-	#[repr(C)]
-	struct CVars {
-		_0x00: [u8; 0x42],
-		flags: u16,
-		_0x44: [u8; 0x04],
-		buckets_ptr: usize,
-		head_index: u16,
-	}
-
-	#[repr(C)]
-	struct Node {
-		data: usize,
-		prev: u16,
-		next: u16,
-	}
-
-	const NULL_NODE: u16 = 0xFFFF;
-	const FLAGS_OFFSET: usize = 0x30;
-	const FLAG_DEVELOPMENTONLY: u64 = 1 << 1;
-
-	let cvars = image.get::<CVars>(cvars).ok_or(ERROR_PARTIAL_COPY)?;
-	let mut node_index = cvars.head_index;
+	let cvars = image.get::<cvar::CCVar>(cvars).ok_or(ERROR_PARTIAL_COPY)?;
 	let mut count = 0;
 
-	if node_index != NULL_NODE {
-		// If this condition is false then the bucket indices are relative to zero
-		// instead of the stored buckets array. This doesn't really make sense, and I
-		// haven't seen it ever happen, but the game code seems to do it so I'm
-		// replicating it here.
-		let buckets = if (cvars.flags & 0x7FFF) != 0 {
-			cvars.buckets_ptr
-		} else {
-			0
-		};
+	// This is the flag that we want to remove.
+	const FLAG_DEVELOPMENTONLY: u64 = 1 << 1;
 
-		loop {
-			let node_addr = buckets + (node_index as usize) * size_of::<Node>();
-			let node = remote::read::<Node>(process, node_addr)?;
-			let flags_addr = node.data + FLAGS_OFFSET;
-			let mut flags = remote::read::<u64>(process, flags_addr)?;
-
+	// Patch variables.
+	{
+		let vars = cvars.vars.read(process)?;
+		for &var_addr in &vars {
+			const FLAGS_OFFSET: usize = offset_of!(cvar::Var, flags);
+			let flags_addr = var_addr as usize + FLAGS_OFFSET;
+			let flags = remote::read::<u64>(process, flags_addr)?;
 			if (flags & FLAG_DEVELOPMENTONLY) != 0 {
-				// Write back with the flag removed.
-				flags &= !FLAG_DEVELOPMENTONLY;
-				remote::write(process, flags_addr, flags)?;
+				remote::write(process, flags_addr, flags & !FLAG_DEVELOPMENTONLY)?;
 				count += 1;
 			}
+		}
+	}
 
-			node_index = node.next;
-			if node_index == NULL_NODE {
-				break;
+	// Patch commands.
+	{
+		let cmds = cvars.cmds.read(process)?;
+		for cmd in &cmds {
+			let flags = cmd.flags;
+			if (flags & FLAG_DEVELOPMENTONLY) != 0 {
+				const FLAGS_OFFSET: usize = offset_of!(cvar::Cmd, flags);
+				let flags_addr = cmds.to_remote(cmd) as usize + FLAGS_OFFSET;
+				remote::write(process, flags_addr, flags & !FLAG_DEVELOPMENTONLY)?;
+				count += 1;
 			}
 		}
 	}

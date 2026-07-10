@@ -22,6 +22,25 @@ pub fn read<T>(process: HANDLE, addr: usize) -> windows::core::Result<T> {
 	}
 }
 
+/// Reads a dynamically-sized array of values from a process's address space.
+pub fn read_array<T>(
+	process: HANDLE,
+	addr: usize,
+	count: usize,
+) -> windows::core::Result<Box<[T]>> {
+	unsafe {
+		let mut buffer = Box::new_uninit_slice(count);
+		ReadProcessMemory(
+			process,
+			addr as _,
+			buffer.as_mut_ptr() as _,
+			count * size_of::<T>(),
+			None,
+		)?;
+		Ok(buffer.assume_init())
+	}
+}
+
 /// Writes a single value to a process's address space.
 pub fn write<T>(process: HANDLE, addr: usize, value: T) -> windows::core::Result<()> {
 	unsafe {
