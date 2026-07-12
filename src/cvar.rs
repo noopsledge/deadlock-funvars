@@ -43,7 +43,7 @@ pub struct Cmd {
 #[repr(C)]
 pub struct List<Data> {
 	count: u16,
-	flags: u16,
+	capacity: u16,
 	nodes_ptr: usize,
 	head: u16,
 	_marker: PhantomData<Data>,
@@ -74,18 +74,7 @@ pub struct ListIterator<'a, Data> {
 impl<Data> List<Data> {
 	/// Reads the entire list into memory.
 	pub fn read(&self, process: HANDLE) -> windows::core::Result<LocalList<Data>> {
-		// If this condition is false then the node indices are relative to zero instead
-		// of the stored nodes array. This doesn't really make sense, and I haven't seen
-		// it ever happen, but the game code seems to do it so I'm replicating it here.
-		let real_nodes_ptr = if (self.flags & 0x7FFF) != 0 {
-			self.nodes_ptr
-		} else {
-			0
-		};
-
-		let nodes = remote::read_array(process, real_nodes_ptr, self.count as usize)?;
-
-		Ok(LocalList {
+		remote::read_array(process, self.nodes_ptr, self.count as usize).map(|nodes| LocalList {
 			nodes,
 			remote_nodes: self.nodes_ptr,
 			head: self.head,
