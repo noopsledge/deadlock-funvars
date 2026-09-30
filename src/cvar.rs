@@ -11,9 +11,9 @@ pub struct CCVar {
 	// The variable list stores pointers to the data, whereas the command list
 	// stores the data inline. For our purposes this means that each variable will need a
 	// separate remote memory read.
-	_0x00: [u8; 0x40],
+	_0x00: [u8; 0x48],
 	pub vars: List<*const Var>,
-	_0x58: [u8; 0xA0],
+	_0x60: [u8; 0xA0],
 	pub cmds: List<Cmd>,
 	// etc...
 }
